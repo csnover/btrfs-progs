@@ -46,6 +46,7 @@
 #include "common/units.h"
 #include "common/format-output.h"
 #include "common/tree-search.h"
+#include "common/parse-utils.h"
 #include "cmds/commands.h"
 #include "cmds/qgroup.h"
 
@@ -140,62 +141,26 @@ static const char * const cmd_subvolume_create_usage[] = {
 	NULL
 };
 
-static int create_one_subvolume(const char *dst, struct btrfs_qgroup_inherit *inherit,
+static int create_one_subvolume(const char *dst, struct btrfs_util_qgroup_inherit *inherit,
 				bool create_parents)
 {
 	int ret;
-	int len;
-	int	fddst = -1;
-	char	*dupname = NULL;
-	char	*dupdir = NULL;
-	const char *newname;
-	char	*dstdir;
-
-	ret = path_is_dir(dst);
-	if (ret < 0 && ret != -ENOENT) {
-		errno = -ret;
-		error("cannot access %s: %m", dst);
-		goto out;
-	}
-	if (ret >= 0) {
-		error("target path already exists: %s", dst);
-		ret = -EEXIST;
-		goto out;
-	}
-
-	dupname = strdup(dst);
-	if (!dupname) {
-		error_msg(ERROR_MSG_MEMORY, "duplicating %s", dst);
-		ret = -ENOMEM;
-		goto out;
-	}
-	newname = path_basename(dupname);
-
-	dupdir = strdup(dst);
-	if (!dupdir) {
-		error_msg(ERROR_MSG_MEMORY, "duplicating %s", dst);
-		ret = -ENOMEM;
-		goto out;
-	}
-	dstdir = path_dirname(dupdir);
-
-	if (!test_issubvolname(newname)) {
-		error("invalid subvolume name: %s", newname);
-		ret = -EINVAL;
-		goto out;
-	}
-
-	len = strlen(newname);
-	if (len > BTRFS_VOL_NAME_MAX) {
-		error("subvolume name too long: %s", newname);
-		ret = -EINVAL;
-		goto out;
-	}
+	enum btrfs_util_error err;
 
 	if (create_parents) {
 		char p[PATH_MAX] = { 0 };
 		char dstdir_dup[PATH_MAX];
+		char *dupdir = NULL;
+		char *dstdir;
 		char *token;
+
+		dupdir = strdup(dst);
+		if (!dupdir) {
+			error_msg(ERROR_MSG_MEMORY, "duplicating %s", dst);
+			free(dupdir);
+			return -ENOMEM;
+		}
+		dstdir = path_dirname(dupdir);
 
 		strncpy_null(dstdir_dup, dstdir, sizeof(dstdir_dup));
 		if (dstdir_dup[0] == '/')
@@ -209,61 +174,68 @@ static int create_one_subvolume(const char *dst, struct btrfs_qgroup_inherit *in
 				ret = mkdir(p, 0777);
 				if (ret < 0) {
 					error("failed to create directory %s: %m", p);
-					goto out;
+					free(dupdir);
+					return ret;
 				}
 			} else if (ret <= 0) {
 				if (ret == 0)
 					ret = -EEXIST;
 				errno = ret ;
 				error("failed to check directory %s before creation: %m", p);
-				goto out;
+				free(dupdir);
+				return ret;
 			}
 			strcat(p, "/");
 			token = strtok(NULL, "/");
 		}
+
+		free(dupdir);
 	}
 
-	fddst = btrfs_open_dir(dstdir);
-	if (fddst < 0) {
-		ret = fddst;
-		goto out;
+	pr_verbose(LOG_DEFAULT, "Create subvolume '%s'\n", dst);
+
+	err = btrfs_util_create_subvolume(dst, 0, NULL, inherit);
+	if (err) {
+		error_btrfs_util(err);
+		return 1;
 	}
 
-	if (inherit) {
-		struct btrfs_ioctl_vol_args_v2	args;
-
-		memset(&args, 0, sizeof(args));
-		strncpy_null(args.name, newname, sizeof(args.name));
-		args.flags |= BTRFS_SUBVOL_QGROUP_INHERIT;
-		args.size = btrfs_qgroup_inherit_size(inherit);
-		args.qgroup_inherit = inherit;
-
-		ret = ioctl(fddst, BTRFS_IOC_SUBVOL_CREATE_V2, &args);
-	} else {
-		struct btrfs_ioctl_vol_args	args;
-
-		memset(&args, 0, sizeof(args));
-		strncpy_null(args.name, newname, sizeof(args.name));
-		ret = ioctl(fddst, BTRFS_IOC_SUBVOL_CREATE, &args);
-	}
-
-	if (ret < 0) {
-		error("cannot create subvolume: %m");
-		goto out;
-	}
-	pr_verbose(LOG_DEFAULT, "Create subvolume '%s/%s'\n", dstdir, newname);
-
-out:
-	close(fddst);
-	free(dupname);
-	free(dupdir);
-
-	return ret;
+	return 0;
 }
+
+static int qgroup_inherit_add_group(struct btrfs_util_qgroup_inherit **inherit,
+				    const char *arg)
+{
+	enum btrfs_util_error err;
+	u64 qgroupid;
+
+	if (!*inherit) {
+		err = btrfs_util_create_qgroup_inherit(0, inherit);
+		if (err) {
+			error_btrfs_util(err);
+			return -1;
+		}
+	}
+
+	qgroupid = parse_qgroupid_or_path(optarg);
+	if (qgroupid == 0) {
+		error("invalid qgroup specification, qgroupid must not be 0");
+		return -1;
+	}
+
+	err = btrfs_util_qgroup_inherit_add_group(inherit, qgroupid);
+	if (err) {
+		error_btrfs_util(err);
+		return -1;
+	}
+
+	return 0;
+}
+
 static int cmd_subvolume_create(const struct cmd_struct *cmd, int argc, char **argv)
 {
 	int retval, ret;
-	struct btrfs_qgroup_inherit *inherit = NULL;
+	struct btrfs_util_qgroup_inherit *inherit = NULL;
 	bool has_error = false;
 	bool create_parents = false;
 
@@ -281,7 +253,7 @@ static int cmd_subvolume_create(const struct cmd_struct *cmd, int argc, char **a
 
 		switch (c) {
 		case 'i':
-			ret = btrfs_qgroup_inherit_add_group(&inherit, optarg);
+			ret = qgroup_inherit_add_group(&inherit, optarg);
 			if (ret) {
 				retval = ret;
 				goto out;
@@ -310,7 +282,8 @@ static int cmd_subvolume_create(const struct cmd_struct *cmd, int argc, char **a
 	if (!has_error)
 		retval = 0;
 out:
-	free(inherit);
+	if (inherit)
+		btrfs_util_destroy_qgroup_inherit(inherit);
 
 	return retval;
 }
