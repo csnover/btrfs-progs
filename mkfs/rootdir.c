@@ -418,6 +418,18 @@ static int ftw_add_inode(const char *full_path, const struct stat *st,
 	u64 ino;
 	int ret;
 
+	/*
+	 * Hard link need extra detection code, not support for now.
+	 *
+	 * st_nlink on directories is fs specific, so only check it on
+	 * non-directory inodes.
+	 */
+	if (unlikely(!S_ISDIR(st->st_mode) && st->st_nlink > 1)) {
+		error("'%s' has extra hard links, not supported for now",
+			full_path);
+		return -EOPNOTSUPP;
+	}
+
 	/* The rootdir itself. */
 	if (unlikely(ftwbuf->level == 0)) {
 		u64 root_ino = btrfs_root_dirid(&root->root_item);
